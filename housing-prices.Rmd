@@ -1,0 +1,485 @@
+---
+title: "housing prices"
+author: "James(Changhwan) Han (3923257)"
+date: "6/2/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+\
+The purpose of this project is to generate a model that will predict the median housing prices for California districts.
+\
+
+# About Dataset
+\
+The data contains median house prices for California districts derived from the 1990 census. \
+Obtained from Kaggle, https://www.kaggle.com/datasets/camnugent/california-housing-prices, the data includes 20640 observations and 9 predictors; longitude, latitude, housing_median_age, total_rooms, total_bedrooms, population, households, median_income, and ocean_proximity. 
+\
+There are 207 missing values in total_bedrooms column.
+\
+
+# Loading Data and Packages
+\
+Here are some of the key variables that are helpful for this project, the codebook is also included in the zipped files. \
+\
+1. longitude: A measure of how far west a house is; a higher value is farther west \
+2. latitude: A measure of how far north a house is; a higher value is farther north \
+3. housingMedianAge: Median age of a house within a block; a lower number is a newer building \
+4. totalRooms: Total # of rooms within a block \
+5. totalBedrooms: Total # of bedrooms within a block \
+6. population: Total # of people residing within a block \
+7. households: Total # of households, a group of people residing within a home unit, for a block \
+8. medianIncome: Median income for households within a block of houses  (measured in tens of thousands of US Dollars) \
+9. medianHouseValue: Median house value for households within a block (measured in US Dollars) \
+10. oceanProximity: Location of the house with reference to ocean/sea 
+\
+
+```{r, warning = FALSE, message = FALSE}
+# load packages
+library("janitor")
+library(tidymodels)
+library(tidyverse)
+library(corrplot)
+library(png) 
+library(grid) 
+tidymodels_prefer()
+library(kknn)
+library(kernlab)
+library(rlang)
+library(knitr)
+library(discrim)
+library(klaR)
+library(glmnet)
+library(rpart.plot)
+library(ranger)
+library(vip)
+
+# set seed
+set.seed(1014)
+```
+
+```{r, message = FALSE}
+# read in data
+housing <- read_csv("housing.csv")
+```
+
+# Data Cleaning
+```{r}
+head(housing)
+summary(housing)
+table(housing$ocean_proximity)
+```
+
+From the summary and head function, we could observe the followings. \
+1. There are 207 missing values in total_bedrooms and we will replace missing values with median. We use median instead of mean since it is less influenced by extreme outliers. \
+2. We will turn the total_bedrooms and total_rooms into a mean_number_bedrooms and mean_number_rooms because they are likely more accurate depections of the houses in a given group. \
+3. There are 5 different categorical variables in ocean_proximity and we will split the ocean_proximity into binary columns. \
+\
+
+* Replace missing values with median in total_bedrooms.
+```{r}
+housing$total_bedrooms[is.na(housing$total_bedrooms)] = median(housing$total_bedrooms, na.rm = TRUE)
+```
+
+* Modify the total columns - turn them into means 
+```{r}
+housing$mean_bedrooms = housing$total_bedrooms/housing$households
+housing$mean_rooms = housing$total_rooms/housing$households
+
+drops = c('total_bedrooms', 'total_rooms')
+
+housing = housing[ , !(names(housing) %in% drops)]
+
+head(housing)
+```
+
+* Turn categorical variables into booleans
+```{r}
+housing %>%
+  ggplot(aes(x= ocean_proximity)) + 
+  geom_bar()
+```
+\
+In ocean_proximity column, there are 5 different categorical variables and we are going to turn these into booleans.
+\
+\
+
+```{r}
+categories = unique(housing$ocean_proximity)
+# split the categories off
+cat_housing = data.frame(ocean_proximity = housing$ocean_proximity)
+```
+
+```{r}
+for(cat in categories){
+  cat_housing[, cat] = rep(0, times = nrow(cat_housing))
+}
+head(cat_housing)
+```
+
+```{r}
+for(i in 1:length(cat_housing$ocean_proximity)){
+    cat = as.character(cat_housing$ocean_proximity[i])
+    cat_housing[,cat][i] = 1
+}
+
+head(cat_housing)
+```
+
+```{r}
+cat_columns = names(cat_housing)
+keep_columns = cat_columns[cat_columns != 'ocean_proximity']
+cat_housing = select(cat_housing,one_of(keep_columns))
+
+tail(cat_housing)
+```
+
+## Scale the numerical variables
+\
+we are going to scale very one of the numericals except for 'median_house_value' which is the response varaible we will be working to predict. The x values are scaled so that the coefficients in things like support vector machines are given equal weight, but y value scale don't affect the learning algorithms in the same way.
+\
+
+```{r}
+drops = c('ocean_proximity','median_house_value')
+housing_num =  housing[ , !(names(housing) %in% drops)]
+
+head(housing_num)
+```
+
+```{r}
+scaled_housing_num = scale(housing_num)
+
+head(scaled_housing_num)
+```
+
+## Merge the altered numerical and categorical dataframes and clean names
+```{r}
+cleaned_housing = cbind(cat_housing, scaled_housing_num, median_house_value=housing$median_house_value)
+
+cleaned_housing <- cleaned_housing %>%
+  clean_names()
+
+head(cleaned_housing)
+```
+
+# Exploratory Data Analysis
+\
+After data cleaning, we are going to visualize the data for better understanding of the dataset. 
+\
+\
+
+```{r}
+cleaned_housing %>%
+  ggplot(aes(x = median_house_value)) +
+  geom_histogram(bins = 60) +
+  theme_bw()
+```
+\
+The distribution of median_house_value is right skewed and there exists an outlier.
+\
+\
+
+```{r}
+cleaned_housing %>% 
+  select(-near_bay, -x1h_ocean, -inland, -near_ocean, -island) %>% 
+  cor(use = "complete.obs") %>% 
+  corrplot(type = "lower", diag = FALSE)
+```
+\
+It appears that there is a strong negative correlation between latitude and longitude. Also, there are strong correlations between households-population, median_house_value-median_income, and mean_rooms-mean_bedrooms. 
+\
+\
+
+```{r}
+california_image <- png::readPNG("Relief_map_of_California.png")
+
+ggplot(housing, aes(x=longitude,y=latitude, col=median_house_value)) + 
+  annotation_custom(rasterGrob(california_image, width = unit(1,"npc"), height = unit(1,"npc")),-Inf, Inf, -Inf, Inf) +
+  geom_point() + scale_color_gradientn(colours = c("blue","green","red"))
+```
+\
+This shows how median_house_value is distributed all over California. It appears that there are houses concentrated near the seaside and they are likely to cost more than other houses that are farther from the seaside.
+\
+\
+
+# Data Splitting
+The data was split in a 80% training, 20% testing split. Stratified sampling was used as the median_house_value distribution was skewed.
+\
+
+```{r}
+cleaned_housing_split <- cleaned_housing %>%
+  initial_split(prop = 0.8, strata = "median_house_value")
+
+cleaned_housing_train <- training(cleaned_housing_split)
+cleaned_housing_test <- testing(cleaned_housing_split)
+
+dim(cleaned_housing_train)
+dim(cleaned_housing_test)
+```
+The training set has about 16500+ observations and the testing data has about 4100+ observations. 
+\
+\
+
+We are going to create a recipe and use stratified CV with repeats.
+```{r}
+cleaned_housing_recipe <- recipe(median_house_value ~ ., data = cleaned_housing_train) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_predictors())
+```
+
+```{r}
+cleaned_housing_fold <- vfold_cv(cleaned_housing_train, v = 5, strata = median_house_value)
+```
+\
+Since the response variable median_house_value is continuous variable, we are going to use regression models rather than classification models. First, we are going to introduce a KNN model.
+\
+\
+
+## KNN model
+```{r}
+knn_model <-
+  nearest_neighbor(
+    neighbors = tune(),
+    mode = "regression") %>%
+  set_engine("kknn")
+
+knn_workflow <- workflow() %>%
+  add_model(knn_model) %>%
+  add_recipe(cleaned_housing_recipe)
+```
+\ 
+KNN model could be used for both regression and classification model but here, we are going to set the mode as "regression" since the response variable is not categorical.
+\
+\
+
+```{r}
+cleaned_housing_grid <- tibble(neighbors=seq(from=1, to=10, by=2))
+
+cleaned_housing_results <- knn_workflow%>%
+    tune_grid(resamples=cleaned_housing_fold, grid=cleaned_housing_grid) 
+```
+\
+In order to get a minimal RMSE(Root Mean Square Error), we are going to make a tibble of values from 1 to 10, incrementing by 2, for all the models except for SVM model.
+\
+\
+
+```{r}
+autoplot(cleaned_housing_results, metric = "rmse")
+```
+
+```{r}
+show_best(cleaned_housing_results, metric = "rmse")
+```
+\
+According to the graph and chart above, we have minimal rmse when neighbors = 3.
+\
+\
+
+Down below, we are going to add cleaned_housing_fit to the workflow where we added KNN model and recipe, and fit the model into cleaned_housing_train. The cleaned_housing_summary stores the result of predicting cleaned_housing_test and metrics.
+\
+
+```{r}
+cleaned_housing_spec <- nearest_neighbor(weight_func="rectangular", neighbors=3) %>%
+    set_engine("kknn")%>%
+    set_mode("regression")
+cleaned_housing_fit <- workflow() %>%
+    add_recipe(cleaned_housing_recipe) %>%
+    add_model(cleaned_housing_spec)%>%
+    fit(data=cleaned_housing_train)
+cleaned_housing_summary <- cleaned_housing_fit %>%
+    predict(cleaned_housing_test) %>%
+    bind_cols(cleaned_housing_test) %>%
+    metrics(truth=median_house_value, estimate=.pred) %>%
+    filter(.metric=="rmse")
+cleaned_housing_summary
+```
+
+```{r}
+augment(cleaned_housing_fit, new_data = cleaned_housing_test) %>%
+  ggplot(aes(median_house_value, .pred)) +
+  geom_abline() +
+  geom_point(alpha = 0.5)
+```
+## SVM Model
+As mentioned earlier, we are going to use grid_regular rather than the methods we used for three other models. We will set range=c(-3,-1) with level of 10 for the cost value.
+\
+\
+
+```{r}
+svm_model <-
+  svm_poly(
+    cost = tune(),
+    mode = "regression") %>%
+  set_engine("kernlab")
+```
+
+```{r}
+svm_workflow <- workflow() %>%
+  add_model(svm_model) %>%
+  add_recipe(cleaned_housing_recipe)
+```
+
+```{r}
+cleaned_housing_grid_svm <- grid_regular(cost(range = c(-3, -1)), levels = 10)
+
+cleaned_housing_results_svm <- svm_workflow %>%
+    tune_grid(resamples=cleaned_housing_fold, grid=cleaned_housing_grid_svm) 
+    
+```
+
+```{r}
+autoplot(cleaned_housing_results_svm, metric = "rmse")
+```
+
+```{r}
+show_best(cleaned_housing_results_svm, metric = "rmse")
+```
+According to the chart and graph above, the lowest rmse occur when cost value is equal to 0.1984251.
+
+```{r}
+cleaned_housing_spec_svm <- svm_poly(cost=0.1984251) %>%
+    set_engine("kernlab")%>%
+    set_mode("regression")
+cleaned_housing_fit_svm <- workflow() %>%
+    add_recipe(cleaned_housing_recipe) %>%
+    add_model(cleaned_housing_spec_svm)%>%
+    fit(data=cleaned_housing_train)
+cleaned_housing_summary_svm <- cleaned_housing_fit_svm %>%
+    predict(cleaned_housing_test) %>%
+    bind_cols(cleaned_housing_test) %>%
+    metrics(truth= median_house_value, estimate=.pred) %>%
+    filter(.metric=="rmse")
+cleaned_housing_summary_svm
+```
+
+```{r}
+augment(cleaned_housing_fit_svm, new_data = cleaned_housing_test) %>%
+  ggplot(aes(median_house_value, .pred)) +
+  geom_abline() +
+  geom_point(alpha = 0.5)
+```
+
+# Random Forest Model
+```{r}
+rf_model <-
+  rand_forest(
+    mtry = tune(),
+    mode = "regression") %>%
+  set_engine("ranger")
+
+rf_workflow <- workflow() %>%
+  add_model(rf_model) %>%
+  add_recipe(cleaned_housing_recipe)
+```
+
+```{r}
+cleaned_housing_grid_rf <- tibble(mtry=seq(from=1, to=10, by=2))
+
+cleaned_housing_results_rf <- rf_workflow %>%
+    tune_grid(resamples= cleaned_housing_fold, grid= cleaned_housing_grid_rf)
+```
+
+```{r}
+autoplot(cleaned_housing_results_rf, metric = "rmse")
+
+```
+
+```{r}
+show_best(cleaned_housing_results_rf, metric = "rmse")
+```
+According to the cart and graph above, we can tell the lowest rmse occurs when mtry value is equal to 7.
+
+```{r}
+cleaned_housing_spec_rf <- rand_forest(mtry=7) %>%
+    set_engine("ranger")%>%
+    set_mode("regression")
+cleaned_housing_fit_rf <- workflow() %>%
+    add_recipe(cleaned_housing_recipe) %>%
+    add_model(cleaned_housing_spec_rf)%>%
+    fit(data=cleaned_housing_train)
+cleaned_housing_summary_rf <- cleaned_housing_fit_rf %>%
+    predict(cleaned_housing_test) %>%
+    bind_cols(cleaned_housing_test) %>%
+    metrics(truth=median_house_value, estimate=.pred) %>%
+    filter(.metric=="rmse")
+cleaned_housing_summary_rf
+```
+
+```{r}
+augment(cleaned_housing_fit_rf, new_data = cleaned_housing_test) %>%
+  ggplot(aes(median_house_value, .pred)) +
+  geom_abline() +
+  geom_point(alpha = 0.5)
+```
+
+# Boost Tree Model
+```{r}
+bt_model <-
+  boost_tree(
+    mtry = tune(),
+    mode = "regression") %>%
+  set_engine("xgboost")
+
+bt_workflow <- workflow() %>%
+  add_model(bt_model) %>%
+  add_recipe(cleaned_housing_recipe)
+```
+
+```{r, warning = FALSE}
+cleaned_housing_grid_bt <- tibble(mtry=seq(from=1, to=10, by=2))
+
+cleaned_housing_results_bt <- bt_workflow %>%
+    tune_grid(resamples=cleaned_housing_fold, grid=cleaned_housing_grid_bt)
+```
+
+```{r}
+autoplot(cleaned_housing_results_bt, metric = "rmse")
+```
+
+```{r}
+show_best(cleaned_housing_results_bt, metric = "rmse")
+```
+According to both of the chart and the graph above, we could say the lowest rmse occurs when mtry values is equal to 9.
+
+```{r}
+cleaned_housing_spec_bt <- boost_tree(mtry=7) %>%
+    set_engine("xgboost")%>%
+    set_mode("regression")
+cleaned_housing_fit_bt <- workflow() %>%
+    add_recipe(cleaned_housing_recipe) %>%
+    add_model(cleaned_housing_spec_bt)%>%
+    fit(data=cleaned_housing_train)
+cleaned_housing_summary_bt <- cleaned_housing_fit_bt %>%
+    predict(cleaned_housing_test) %>%
+    bind_cols(cleaned_housing_test) %>%
+    metrics(truth=median_house_value, estimate=.pred) %>%
+    filter(.metric=="rmse")
+cleaned_housing_summary_bt
+```
+
+```{r}
+augment(cleaned_housing_fit_bt, new_data = cleaned_housing_test) %>%
+  ggplot(aes(median_house_value, .pred)) +
+  geom_abline() +
+  geom_point(alpha = 0.5)
+```
+
+# Conclusion
+The RMSE value for KNN, SVm, Random Forest, and Boost Tree is 60565.46, 69693.23, 47680.92, 52923.12 respectively. We could conclude that the Boost Tree performed the best while KNN model performed the worst.
+```{r}
+Model <- c('K-nearest neighbors', 'Support Vector Machine', 'Random Forest', 'Boost Tree')
+cleaned_housing_summary <- select_if(cleaned_housing_summary, is.numeric)
+cleaned_housing_summary_svm <- select_if(cleaned_housing_summary_svm, is.numeric)
+cleaned_housing_summary_rf <- select_if(cleaned_housing_summary_rf, is.numeric)
+cleaned_housing_summary_bt <- select_if(cleaned_housing_summary_bt, is.numeric)
+RMSE <- c(cleaned_housing_summary, cleaned_housing_summary_svm, cleaned_housing_summary_rf, cleaned_housing_summary_bt)
+RMSE_value <- as.numeric(RMSE)
+
+Table <- data.frame(Model,RMSE_value)
+Table
+```
+
